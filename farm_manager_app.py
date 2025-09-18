@@ -6,7 +6,6 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 from fpdf import FPDF
 import json
-import qrcode
 
 # ---------------------------
 # Config & DB setup
@@ -18,11 +17,14 @@ DB_PATH = Path("farm.db")
 conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 
-# Create tables if not exist
+# ---------------------------
+# Tables creation (enhanced)
+# ---------------------------
 c.execute("""
 CREATE TABLE IF NOT EXISTS sites (
     site_id INTEGER PRIMARY KEY AUTOINCREMENT,
     site_name TEXT,
+    site_type TEXT DEFAULT 'farm',  -- 'farm' or 'market'
     address TEXT,
     phone TEXT,
     notes TEXT
@@ -53,6 +55,9 @@ CREATE TABLE IF NOT EXISTS sales (
     subtotal REAL,
     tax REAL,
     total REAL,
+    payment_type TEXT,
+    cash_given REAL DEFAULT 0,
+    change_due REAL DEFAULT 0,
     notes TEXT,
     FOREIGN KEY(site_id) REFERENCES sites(site_id)
 )
@@ -65,7 +70,7 @@ conn.commit()
 def check_password():
     pw_secret = None
     try:
-        pw_secret = st.secrets["FARM_PASSWORD"]
+        pw_secret = st.secrets["FARM"]["FARM_PASSWORD"]
     except Exception:
         pw_secret = None
     expected = pw_secret if pw_secret else "admin123"
@@ -79,7 +84,6 @@ def check_password():
         if st.button("Enter"):
             if pw == expected:
                 st.session_state.auth_ok = True
-                st.experimental_rerun()
             else:
                 st.error("Incorrect password")
         st.stop()
@@ -87,7 +91,7 @@ def check_password():
 check_password()
 
 # ---------------------------
-# Small UI polish
+# UI polish
 # ---------------------------
 st.markdown("""
 <style>
@@ -96,75 +100,87 @@ h1 {text-align:center;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🚜 Farm Management & POS")
+st.title("🚜 Farm Manager (Enhanced)")
 
 # ---------------------------
 # Sidebar
 # ---------------------------
 st.sidebar.header("Quick Actions")
-if st.sidebar.button("Add Site"):
-    st.session_state.show_add_site = True
-if st.sidebar.button("Add Crop/Item"):
-    st.session_state.show_add_crop = True
-if st.sidebar.button("Open POS"):
-    st.session_state.show_pos = True
-if st.sidebar.button("Export All CSVs"):
-    # export all tables to CSV
-    with BytesIO() as bio:
-        sites_df = pd.read_sql("SELECT * FROM sites", conn)
-        crops_df = pd.read_sql("SELECT * FROM crops", conn)
-        sales_df = pd.read_sql("SELECT * FROM sales", conn)
-        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-            sites_df.to_excel(writer, sheet_name="Sites", index=False)
-            crops_df.to_excel(writer, sheet_name="Crops", index=False)
-            sales_df.to_excel(writer, sheet_name="Sales", index=False)
-        st.download_button("Download All Data (Excel)", bio.getvalue(), "farm_data.xlsx")
+st.sidebar.button("Add Site", on_click=lambda: st.session_state.update({"show_add_site": True}))
+st.sidebar.button("Add Crop/Item", on_click=lambda: st.session_state.update({"show_add_crop": True}))
+st.sidebar.button("Open POS", on_click=lambda: st.session_state.update({"show_pos": True}))
+st.sidebar.button("Export All CSVs", on_click=lambda: st.session_state.update({"export_all": True}))
 
 # ---------------------------
 # Tabs
 # ---------------------------
-tabs = st.tabs(["Farm Management", "POS", "Dashboard & Reports", "Data Export"])
+tabs = st.tabs(["Dashboard", "Farm Management", "POS", "Reports & Export"])
 
 # ---------------------------
-# Tab 1: Farm Management
+# Tab 1: Dashboard
 # ---------------------------
 with tabs[0]:
-    st.header("🌾 Farm Management")
+    st.header("📊 Main Dashboard")
+    crops_df = pd.read_sql("SELECT * FROM crops", conn)
+    sites_df = pd.read_sql("SELECT * FROM sites WHERE site_type='farm'", conn)
+    sales_df = pd.read_sql("SELECT * FROM sales", conn)
 
-    # Sites
-    st.subheader("Sites")
+    if not crops_df.empty:
+        crops_df["expected_harvest_date"] = pd.to_datetime(crops_df["expected_harvest_date"])
+        crops_df["days_until_harvest"] = (crops_df["expected_harvest_date"] - pd.Timestamp.today()).dt.days
+
+        st.subheader("Active Crops / Items")
+        st.dataframe(crops_df[["item_name","site_id","available_qty","unit"]], use_container_width=True)
+
+        st.subheader("Harvest Due Soon (7 days)")
+        due_soon = crops_df[crops_df["days_until_harvest"] <= 7]
+        st.dataframe(due_soon[["item_name","site_id","expected_harvest_date","days_until_harvest"]], use_container_width=True)
+
+    else:
+        st.info("No crops yet")
+
+    if not sales_df.empty:
+        st.subheader("Total Sales")
+        st.write(f"Total sales records: {len(sales_df)}")
+        st.write(f"Total revenue: ${sales_df['total'].sum():.2f}")
+    else:
+        st.info("No sales yet")
+
+# ---------------------------
+# Tab 2: Farm Management
+# ---------------------------
+with tabs[1]:
+    st.header("🌾 Farm Management")
     sites_df = pd.read_sql("SELECT * FROM sites", conn)
+    st.subheader("Sites")
     st.dataframe(sites_df, use_container_width=True)
 
     st.markdown("### Add Site")
     with st.form("add_site_form", clear_on_submit=True):
         site_name = st.text_input("Site name")
+        site_type = st.selectbox("Site type", ["farm","market"])
         address = st.text_input("Address")
         phone = st.text_input("Phone")
         notes = st.text_area("Notes", height=80)
         if st.form_submit_button("Add Site"):
-            c.execute("INSERT INTO sites (site_name,address,phone,notes) VALUES (?,?,?,?)",
-                      (site_name,address,phone,notes))
+            c.execute("INSERT INTO sites (site_name,site_type,address,phone,notes) VALUES (?,?,?,?,?)",
+                      (site_name, site_type, address, phone, notes))
             conn.commit()
             st.success(f"Site '{site_name}' added")
-            st.experimental_rerun()
 
-    # Crops
+    # Crops / Items
     st.markdown("---")
     st.subheader("Crops / Items")
     crops_df = pd.read_sql("SELECT * FROM crops", conn)
-    if not crops_df.empty:
-        crops_df["date_planted"] = pd.to_datetime(crops_df["date_planted"])
-        crops_df["expected_harvest_date"] = pd.to_datetime(crops_df["expected_harvest_date"])
-        crops_df["actual_harvest_date"] = pd.to_datetime(crops_df["actual_harvest_date"], errors='coerce')
     st.dataframe(crops_df, use_container_width=True)
 
     st.markdown("### Add Crop / Item")
-    if sites_df.empty:
-        st.warning("Please add a site first.")
+    farm_sites = sites_df[sites_df["site_type"]=="farm"]
+    if farm_sites.empty:
+        st.warning("Please add a farm site first.")
     else:
         with st.form("add_crop_form", clear_on_submit=True):
-            site_choice = st.selectbox("Site", sites_df["site_id"].tolist())
+            site_choice = st.selectbox("Farm Site", farm_sites["site_id"].tolist())
             item_name = st.text_input("Crop / Item name")
             date_planted = st.date_input("Date planted", value=date.today())
             expected_harvest_date = st.date_input("Expected harvest date", value=date.today()+timedelta(days=90))
@@ -182,27 +198,27 @@ with tabs[0]:
                            yield_qty,unit,price_per_unit,yield_qty,notes))
                 conn.commit()
                 st.success(f"Added item '{item_name}'")
-                st.experimental_rerun()
 
 # ---------------------------
-# Tab 2: POS
+# Tab 3: POS
 # ---------------------------
-with tabs[1]:
-    st.header("💵 POS")
-    sites_df = pd.read_sql("SELECT * FROM sites", conn)
-    crops_df = pd.read_sql("SELECT * FROM crops", conn)
+with tabs[2]:
+    st.header("💵 Point of Sale (POS)")
+    sites_df = pd.read_sql("SELECT * FROM sites WHERE site_type='market'", conn)
+    crops_df = pd.read_sql("SELECT * FROM crops WHERE available_qty>0", conn)
+
     if "cart" not in st.session_state:
         st.session_state.cart = []
 
     if sites_df.empty:
-        st.warning("Add a site first to start POS")
+        st.warning("Add a market site first to start POS")
     else:
-        sale_site = st.selectbox("Sale site", sites_df["site_id"].tolist())
+        sale_site = st.selectbox("Sale site (market)", sites_df["site_id"].tolist())
         sale_site_info = sites_df[sites_df["site_id"]==sale_site].iloc[0]
 
         st.markdown(f"**Site:** {sale_site_info['site_name']} - {sale_site_info['address']}")
 
-        available_products = crops_df[crops_df["available_qty"]>0]
+        available_products = crops_df
         prod_map = {f"{row['crop_id']} | {row['item_name']} ({row['available_qty']} {row['unit']}) - ${row['price_per_unit']:.2f}":row for idx,row in available_products.iterrows()}
 
         if prod_map:
@@ -228,6 +244,14 @@ with tabs[1]:
             total = subtotal+tax
             st.markdown(f"**Subtotal:** ${subtotal:.2f}  **Tax:** ${tax:.2f}  **Total:** ${total:.2f}")
 
+            payment_type = st.selectbox("Payment Type", ["Cash","Card"])
+            cash_given = 0
+            change_due = 0
+            if payment_type=="Cash":
+                cash_given = st.number_input("Cash given", min_value=0.0, value=total, step=0.01)
+                change_due = cash_given - total
+                st.markdown(f"**Change due:** ${change_due:.2f}")
+
             receipt_notes = st.text_area("Receipt notes")
             if st.button("Finalize Sale & Generate Receipt"):
                 # reduce inventory
@@ -236,8 +260,9 @@ with tabs[1]:
                               (item["qty"], item["crop_id"]))
                 conn.commit()
                 # create sale
-                c.execute("INSERT INTO sales (date,site_id,items_json,subtotal,tax,total,notes) VALUES (?,?,?,?,?,?,?)",
-                          (datetime.now().isoformat(), sale_site, json.dumps(st.session_state.cart), subtotal, tax, total, receipt_notes))
+                c.execute("INSERT INTO sales (date,site_id,items_json,subtotal,tax,total,payment_type,cash_given,change_due,notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                          (datetime.now().isoformat(), sale_site, json.dumps(st.session_state.cart), subtotal, tax, total,
+                           payment_type, cash_given, change_due, receipt_notes))
                 conn.commit()
                 sale_id = c.lastrowid
 
@@ -266,6 +291,10 @@ with tabs[1]:
                 pdf.cell(0,6,f"Subtotal: ${subtotal:.2f}",ln=1)
                 pdf.cell(0,6,f"Tax: ${tax:.2f}",ln=1)
                 pdf.cell(0,6,f"Total: ${total:.2f}",ln=1)
+                pdf.cell(0,6,f"Payment type: {payment_type}",ln=1)
+                if payment_type=="Cash":
+                    pdf.cell(0,6,f"Cash given: ${cash_given:.2f}",ln=1)
+                    pdf.cell(0,6,f"Change due: ${change_due:.2f}",ln=1)
                 if receipt_notes:
                     pdf.multi_cell(0,6,f"Notes: {receipt_notes}")
                 pdf.output(pdf_bytes)
@@ -274,34 +303,11 @@ with tabs[1]:
                 st.success(f"Sale completed (ID {sale_id})")
                 st.session_state.cart = []
 
-        else:
-            st.info("Cart is empty")
-
 # ---------------------------
-# Tab 3: Dashboard & Reports
-# ---------------------------
-with tabs[2]:
-    st.header("📊 Dashboard & Reports")
-    crops_df = pd.read_sql("SELECT * FROM crops", conn)
-    sales_df = pd.read_sql("SELECT * FROM sales", conn)
-    if not crops_df.empty:
-        crops_df["expected_harvest_date"] = pd.to_datetime(crops_df["expected_harvest_date"])
-        crops_df["days_until_harvest"] = (crops_df["expected_harvest_date"]-pd.Timestamp.today()).dt.days
-        st.subheader("Upcoming Harvests")
-        st.dataframe(crops_df[["item_name","site_id","date_planted","expected_harvest_date","days_until_harvest","available_qty","unit"]], use_container_width=True)
-    if not sales_df.empty:
-        st.subheader("Sales Summary")
-        sales_summary = pd.DataFrame([json.loads(s) for s in sales_df["items_json"]])
-        st.write(f"Total sales records: {len(sales_df)}")
-    else:
-        st.info("No sales yet")
-
-# ---------------------------
-# Tab 4: Data Export
+# Tab 4: Reports & Export
 # ---------------------------
 with tabs[3]:
-    st.header("📁 Export Data")
-    st.markdown("Export your farm, crop, and sales data for bookkeeping or analysis.")
+    st.header("📁 Reports & Data Export")
     for tbl in ["sites","crops","sales"]:
         df = pd.read_sql(f"SELECT * FROM {tbl}", conn)
         csv_bytes = df.to_csv(index=False).encode("utf-8")
