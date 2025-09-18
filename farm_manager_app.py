@@ -1,314 +1,269 @@
 import streamlit as st
-import pandas as pd
 import sqlite3
-from pathlib import Path
-from datetime import date, datetime, timedelta
-from io import BytesIO
+from datetime import datetime, timedelta
 from fpdf import FPDF
-import json
+from io import BytesIO
+import qrcode
 
-# ---------------------------
-# Config & DB setup
-# ---------------------------
-st.set_page_config(page_title="Farm Manager", layout="wide")
-DB_PATH = Path("farm.db")
-
-# Connect to SQLite
-conn = sqlite3.connect(DB_PATH)
+# -------------------------
+# DATABASE SETUP
+# -------------------------
+conn = sqlite3.connect("farm_manager.db", check_same_thread=False)
 c = conn.cursor()
 
-# ---------------------------
-# Tables creation (enhanced)
-# ---------------------------
-c.execute("""
+# Sites Table
+c.execute('''
 CREATE TABLE IF NOT EXISTS sites (
-    site_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     site_name TEXT,
-    site_type TEXT DEFAULT 'farm',  -- 'farm' or 'market'
+    site_type TEXT,  -- "field" or "market"
     address TEXT,
-    phone TEXT,
-    notes TEXT
+    phone TEXT
 )
-""")
-c.execute("""
+''')
+
+# Crops/Items Table
+c.execute('''
 CREATE TABLE IF NOT EXISTS crops (
-    crop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     site_id INTEGER,
     item_name TEXT,
     date_planted TEXT,
-    expected_harvest_date TEXT,
-    actual_harvest_date TEXT,
-    yield_qty REAL,
+    expected_harvest TEXT,
+    actual_harvest TEXT,
+    yield_amount REAL,
+    notes TEXT,
+    FOREIGN KEY(site_id) REFERENCES sites(id)
+)
+''')
+
+# Sales Table
+c.execute('''
+CREATE TABLE IF NOT EXISTS sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER,
+    date TEXT,
+    payment_type TEXT,
+    cash_given REAL,
+    change_due REAL,
+    total REAL,
+    notes TEXT,
+    FOREIGN KEY(site_id) REFERENCES sites(id)
+)
+''')
+
+# Sale Items Table
+c.execute('''
+CREATE TABLE IF NOT EXISTS sale_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER,
+    item_name TEXT,
+    qty REAL,
     unit TEXT,
     price_per_unit REAL,
-    available_qty REAL,
-    notes TEXT,
-    FOREIGN KEY(site_id) REFERENCES sites(site_id)
+    FOREIGN KEY(sale_id) REFERENCES sales(id)
 )
-""")
-c.execute("""
-CREATE TABLE IF NOT EXISTS sales (
-    sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    site_id INTEGER,
-    items_json TEXT,
-    subtotal REAL,
-    tax REAL,
-    total REAL,
-    payment_type TEXT,
-    cash_given REAL DEFAULT 0,
-    change_due REAL DEFAULT 0,
-    notes TEXT,
-    FOREIGN KEY(site_id) REFERENCES sites(site_id)
-)
-""")
+''')
 conn.commit()
 
-# ---------------------------
-# Authentication
-# ---------------------------
-def check_password():
-    pw_secret = None
-    try:
-        pw_secret = st.secrets["FARM"]["FARM_PASSWORD"]
-    except Exception:
-        pw_secret = None
-    expected = pw_secret if pw_secret else "admin123"
+# -------------------------
+# LOGIN
+# -------------------------
+st.title("Farm Manager App")
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-    if "auth_ok" not in st.session_state:
-        st.session_state.auth_ok = False
+if not st.session_state.logged_in:
+    password_input = st.text_input("Enter Password", type="password")
+    if st.button("Login"):
+        if password_input == st.secrets.get("FARM_PASSWORD", "admin123"):
+            st.session_state.logged_in = True
+        else:
+            st.error("Incorrect password")
+else:
+    # -------------------------
+    # MAIN DASHBOARD
+    # -------------------------
+    st.header("Dashboard")
+    
+    # Show alerts for harvest due soon
+    st.subheader("Harvest Alerts")
+    today = datetime.now().date()
+    c.execute("SELECT c.item_name, s.site_name, c.expected_harvest FROM crops c JOIN sites s ON c.site_id=s.id WHERE c.actual_harvest IS NULL")
+    crops_due = c.fetchall()
+    for crop in crops_due:
+        harvest_date = datetime.strptime(crop[2], "%Y-%m-%d").date()
+        days_left = (harvest_date - today).days
+        if days_left <= 5:
+            st.warning(f"{crop[0]} at {crop[1]} ready for harvest in {days_left} days (Expected {harvest_date})")
 
-    if not st.session_state.auth_ok:
-        st.markdown("<h3 style='text-align:center;'>🔒 Enter Password to Access Farm Manager</h3>", unsafe_allow_html=True)
-        pw = st.text_input("Password", type="password")
-        if st.button("Enter"):
-            if pw == expected:
-                st.session_state.auth_ok = True
-            else:
-                st.error("Incorrect password")
-        st.stop()
+    # Stock / Inventory summary
+    st.subheader("Current Stock / Inventory")
+    c.execute("SELECT item_name, SUM(yield_amount) FROM crops WHERE actual_harvest IS NOT NULL GROUP BY item_name")
+    stock = c.fetchall()
+    for s_item in stock:
+        st.write(f"{s_item[0]}: {s_item[1]} units available for sale")
 
-check_password()
+    # Revenue summary
+    st.subheader("Revenue Summary")
+    c.execute("SELECT s.site_name, SUM(sa.total) FROM sales sa JOIN sites s ON sa.site_id=s.id GROUP BY s.site_name")
+    revenues = c.fetchall()
+    for rev in revenues:
+        st.write(f"{rev[0]}: ${rev[1] or 0:.2f}")
 
-# ---------------------------
-# UI polish
-# ---------------------------
-st.markdown("""
-<style>
-h1 {text-align:center;}
-.sidebar .block-container {padding-top:1rem;}
-</style>
-""", unsafe_allow_html=True)
+    # -------------------------
+    # POS - Sell Items
+    # -------------------------
+    st.subheader("POS - Sell Items")
 
-st.title("🚜 Farm Manager (Enhanced)")
-
-# ---------------------------
-# Sidebar
-# ---------------------------
-st.sidebar.header("Quick Actions")
-st.sidebar.button("Add Site", on_click=lambda: st.session_state.update({"show_add_site": True}))
-st.sidebar.button("Add Crop/Item", on_click=lambda: st.session_state.update({"show_add_crop": True}))
-st.sidebar.button("Open POS", on_click=lambda: st.session_state.update({"show_pos": True}))
-st.sidebar.button("Export All CSVs", on_click=lambda: st.session_state.update({"export_all": True}))
-
-# ---------------------------
-# Tabs
-# ---------------------------
-tabs = st.tabs(["Dashboard", "Farm Management", "POS", "Reports & Export"])
-
-# ---------------------------
-# Tab 1: Dashboard
-# ---------------------------
-with tabs[0]:
-    st.header("📊 Main Dashboard")
-    crops_df = pd.read_sql("SELECT * FROM crops", conn)
-    sites_df = pd.read_sql("SELECT * FROM sites WHERE site_type='farm'", conn)
-    sales_df = pd.read_sql("SELECT * FROM sales", conn)
-
-    if not crops_df.empty:
-        crops_df["expected_harvest_date"] = pd.to_datetime(crops_df["expected_harvest_date"])
-        crops_df["days_until_harvest"] = (crops_df["expected_harvest_date"] - pd.Timestamp.today()).dt.days
-
-        st.subheader("Active Crops / Items")
-        st.dataframe(crops_df[["item_name","site_id","available_qty","unit"]], use_container_width=True)
-
-        st.subheader("Harvest Due Soon (7 days)")
-        due_soon = crops_df[crops_df["days_until_harvest"] <= 7]
-        st.dataframe(due_soon[["item_name","site_id","expected_harvest_date","days_until_harvest"]], use_container_width=True)
-
+    # Load sites for POS (only markets)
+    c.execute("SELECT id, site_name, site_type FROM sites WHERE site_type='market'")
+    sites = c.fetchall()
+    if not sites:
+        st.warning("No market sites found. Add at least one site of type 'market' first.")
     else:
-        st.info("No crops yet")
+        site_dict = {f"{s[1]} ({s[2]})": s[0] for s in sites}
+        selected_site_name = st.selectbox("Select Sale Site", list(site_dict.keys()))
+        selected_site_id = site_dict[selected_site_name]
 
-    if not sales_df.empty:
-        st.subheader("Total Sales")
-        st.write(f"Total sales records: {len(sales_df)}")
-        st.write(f"Total revenue: ${sales_df['total'].sum():.2f}")
-    else:
-        st.info("No sales yet")
+        # Cart
+        if "cart" not in st.session_state:
+            st.session_state.cart = []
 
-# ---------------------------
-# Tab 2: Farm Management
-# ---------------------------
-with tabs[1]:
-    st.header("🌾 Farm Management")
-    sites_df = pd.read_sql("SELECT * FROM sites", conn)
-    st.subheader("Sites")
-    st.dataframe(sites_df, use_container_width=True)
-
-    st.markdown("### Add Site")
-    with st.form("add_site_form", clear_on_submit=True):
-        site_name = st.text_input("Site name")
-        site_type = st.selectbox("Site type", ["farm","market"])
-        address = st.text_input("Address")
-        phone = st.text_input("Phone")
-        notes = st.text_area("Notes", height=80)
-        if st.form_submit_button("Add Site"):
-            c.execute("INSERT INTO sites (site_name,site_type,address,phone,notes) VALUES (?,?,?,?,?)",
-                      (site_name, site_type, address, phone, notes))
-            conn.commit()
-            st.success(f"Site '{site_name}' added")
-
-    # Crops / Items
-    st.markdown("---")
-    st.subheader("Crops / Items")
-    crops_df = pd.read_sql("SELECT * FROM crops", conn)
-    st.dataframe(crops_df, use_container_width=True)
-
-    st.markdown("### Add Crop / Item")
-    farm_sites = sites_df[sites_df["site_type"]=="farm"]
-    if farm_sites.empty:
-        st.warning("Please add a farm site first.")
-    else:
-        with st.form("add_crop_form", clear_on_submit=True):
-            site_choice = st.selectbox("Farm Site", farm_sites["site_id"].tolist())
-            item_name = st.text_input("Crop / Item name")
-            date_planted = st.date_input("Date planted", value=date.today())
-            expected_harvest_date = st.date_input("Expected harvest date", value=date.today()+timedelta(days=90))
-            actual_harvest_date = st.date_input("Actual harvest date (optional)", value=None)
-            yield_qty = st.number_input("Yield", min_value=0.0, value=0.0, step=0.1)
-            unit = st.text_input("Unit (kg, tray, etc.)", value="kg")
-            price_per_unit = st.number_input("Price per unit", min_value=0.0, value=0.0, step=0.01)
-            notes = st.text_area("Notes", height=80)
-            if st.form_submit_button("Add Crop / Item"):
-                c.execute("""
-                    INSERT INTO crops (site_id,item_name,date_planted,expected_harvest_date,actual_harvest_date,yield_qty,unit,price_per_unit,available_qty,notes)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                          (site_choice,item_name,date_planted.isoformat(),expected_harvest_date.isoformat(),
-                           actual_harvest_date.isoformat() if actual_harvest_date else None,
-                           yield_qty,unit,price_per_unit,yield_qty,notes))
-                conn.commit()
-                st.success(f"Added item '{item_name}'")
-
-# ---------------------------
-# Tab 3: POS
-# ---------------------------
-with tabs[2]:
-    st.header("💵 Point of Sale (POS)")
-    sites_df = pd.read_sql("SELECT * FROM sites WHERE site_type='market'", conn)
-    crops_df = pd.read_sql("SELECT * FROM crops WHERE available_qty>0", conn)
-
-    if "cart" not in st.session_state:
-        st.session_state.cart = []
-
-    if sites_df.empty:
-        st.warning("Add a market site first to start POS")
-    else:
-        sale_site = st.selectbox("Sale site (market)", sites_df["site_id"].tolist())
-        sale_site_info = sites_df[sites_df["site_id"]==sale_site].iloc[0]
-
-        st.markdown(f"**Site:** {sale_site_info['site_name']} - {sale_site_info['address']}")
-
-        available_products = crops_df
-        prod_map = {f"{row['crop_id']} | {row['item_name']} ({row['available_qty']} {row['unit']}) - ${row['price_per_unit']:.2f}":row for idx,row in available_products.iterrows()}
-
-        if prod_map:
-            product_choice = st.selectbox("Select product", list(prod_map.keys()))
-            qty = st.number_input("Quantity", min_value=0.0, value=1.0, step=0.1)
-            if st.button("Add to cart"):
-                r = prod_map[product_choice]
+        with st.expander("Add Item to Cart"):
+            item_name = st.text_input("Item Name", key="item_name")
+            qty = st.number_input("Quantity", min_value=1, value=1, key="qty")
+            unit = st.text_input("Unit", value="pcs", key="unit")
+            price = st.number_input("Price per Unit", min_value=0.0, value=0.0, format="%.2f", key="price")
+            if st.button("Add to Cart"):
                 st.session_state.cart.append({
-                    "crop_id": int(r["crop_id"]),
-                    "item_name": r["item_name"],
-                    "qty": float(qty),
-                    "unit": r["unit"],
-                    "price_per_unit": float(r["price_per_unit"])
+                    "item_name": item_name,
+                    "qty": qty,
+                    "unit": unit,
+                    "price_per_unit": price
                 })
-                st.success("Added to cart")
 
-        st.subheader("Cart")
-        if st.session_state.cart:
-            cart_df = pd.DataFrame(st.session_state.cart)
-            st.dataframe(cart_df, use_container_width=True)
-            subtotal = (cart_df["qty"]*cart_df["price_per_unit"]).sum()
-            tax = 0.0
-            total = subtotal+tax
-            st.markdown(f"**Subtotal:** ${subtotal:.2f}  **Tax:** ${tax:.2f}  **Total:** ${total:.2f}")
+        st.write("Cart:", st.session_state.cart)
 
-            payment_type = st.selectbox("Payment Type", ["Cash","Card"])
-            cash_given = 0
-            change_due = 0
-            if payment_type=="Cash":
-                cash_given = st.number_input("Cash given", min_value=0.0, value=total, step=0.01)
-                change_due = cash_given - total
-                st.markdown(f"**Change due:** ${change_due:.2f}")
+        # Payment
+        payment_type = st.selectbox("Payment Type", ["Cash", "Card"], key="payment_type")
+        subtotal = sum([it["qty"]*it["price_per_unit"] for it in st.session_state.cart])
+        tax = subtotal * 0.07
+        total = subtotal + tax
+        cash_given = 0.0
+        change_due = 0.0
+        if payment_type == "Cash":
+            cash_given = st.number_input("Cash Given", min_value=0.0, value=total, format="%.2f", key="cash_given")
+            change_due = cash_given - total
 
-            receipt_notes = st.text_area("Receipt notes")
-            if st.button("Finalize Sale & Generate Receipt"):
-                # reduce inventory
-                for item in st.session_state.cart:
-                    c.execute("UPDATE crops SET available_qty=available_qty-? WHERE crop_id=?",
-                              (item["qty"], item["crop_id"]))
-                conn.commit()
-                # create sale
-                c.execute("INSERT INTO sales (date,site_id,items_json,subtotal,tax,total,payment_type,cash_given,change_due,notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                          (datetime.now().isoformat(), sale_site, json.dumps(st.session_state.cart), subtotal, tax, total,
-                           payment_type, cash_given, change_due, receipt_notes))
-                conn.commit()
+        receipt_notes = st.text_area("Notes", key="notes")
+
+        if st.button("Complete Sale"):
+            if not st.session_state.cart:
+                st.error("Cart is empty!")
+            else:
+                # Save sale
+                c.execute("INSERT INTO sales (site_id, date, payment_type, cash_given, change_due, total, notes) VALUES (?,?,?,?,?,?,?)",
+                          (selected_site_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), payment_type, cash_given, change_due, total, receipt_notes))
                 sale_id = c.lastrowid
 
-                # generate PDF
-                pdf_bytes = BytesIO()
-                pdf = FPDF()
-                pdf.add_page()
-                pdf.set_font("Arial","B",14)
-                pdf.cell(0,8, f"{sale_site_info['site_name']}", ln=1)
-                pdf.set_font("Arial","",12)
-                pdf.cell(0,6, f"{sale_site_info['address']}", ln=1)
-                pdf.cell(0,6, f"Phone: {sale_site_info['phone']}", ln=1)
-                pdf.ln(4)
-                pdf.cell(0,6, f"Receipt #{sale_id} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=1)
-                pdf.ln(4)
-                pdf.cell(100,6,"Item",1)
-                pdf.cell(30,6,"Qty",1)
-                pdf.cell(30,6,"Unit",1)
-                pdf.cell(30,6,"Price",1,ln=1)
                 for it in st.session_state.cart:
-                    pdf.cell(100,6,it["item_name"],1)
-                    pdf.cell(30,6,str(it["qty"]),1)
-                    pdf.cell(30,6,it["unit"],1)
-                    pdf.cell(30,6,f"${it['price_per_unit']:.2f}",1,ln=1)
+                    c.execute("INSERT INTO sale_items (sale_id, item_name, qty, unit, price_per_unit) VALUES (?,?,?,?,?)",
+                              (sale_id, it["item_name"], it["qty"], it["unit"], it["price_per_unit"]))
+                conn.commit()
+
+                # -------------------------
+                # Modern PDF Receipt
+                # -------------------------
+                pdf_bytes = BytesIO()
+                pdf = FPDF(orientation='P', unit='mm', format='A4')
+                pdf.add_page()
+                pdf.set_auto_page_break(auto=True, margin=15)
+
+                # Branding Header
+                pdf.set_font("Arial", "B", 18)
+                pdf.set_text_color(34, 139, 34)
+                pdf.cell(0, 10, f"{selected_site_name}", ln=1, align="C")
+                pdf.set_font("Arial", "", 12)
+                pdf.set_text_color(0, 0, 0)
+                pdf.ln(5)
+
+                # Receipt Info
+                pdf.set_font("Arial", "B", 14)
+                pdf.cell(0, 6, f"Receipt #{sale_id} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=1)
+                pdf.ln(3)
+
+                # Table Header
+                pdf.set_font("Arial", "B", 12)
+                pdf.set_fill_color(34, 139, 34)
+                pdf.set_text_color(255, 255, 255)
+                pdf.cell(100, 8, "Item", 1, 0, "C", fill=True)
+                pdf.cell(30, 8, "Qty", 1, 0, "C", fill=True)
+                pdf.cell(30, 8, "Unit", 1, 0, "C", fill=True)
+                pdf.cell(30, 8, "Price", 1, 1, "C", fill=True)
+
+                # Table Rows
+                pdf.set_font("Arial", "", 12)
+                pdf.set_text_color(0, 0, 0)
+                fill = False
+                for it in st.session_state.cart:
+                    item_name_safe = it["item_name"].encode('latin-1', 'replace').decode('latin-1')
+                    pdf.set_fill_color(240, 248, 255)
+                    pdf.cell(100, 6, item_name_safe, 1, 0, "L", fill=fill)
+                    pdf.cell(30, 6, str(it["qty"]), 1, 0, "C", fill=fill)
+                    pdf.cell(30, 6, it["unit"], 1, 0, "C", fill=fill)
+                    pdf.cell(30, 6, f"${it['price_per_unit']:.2f}", 1, 1, "R", fill=fill)
+                    fill = not fill
+
+                # Totals
                 pdf.ln(2)
-                pdf.cell(0,6,f"Subtotal: ${subtotal:.2f}",ln=1)
-                pdf.cell(0,6,f"Tax: ${tax:.2f}",ln=1)
-                pdf.cell(0,6,f"Total: ${total:.2f}",ln=1)
-                pdf.cell(0,6,f"Payment type: {payment_type}",ln=1)
-                if payment_type=="Cash":
-                    pdf.cell(0,6,f"Cash given: ${cash_given:.2f}",ln=1)
-                    pdf.cell(0,6,f"Change due: ${change_due:.2f}",ln=1)
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 6, f"Subtotal: ${subtotal:.2f}", ln=1)
+                pdf.cell(0, 6, f"Tax: ${tax:.2f}", ln=1)
+                pdf.cell(0, 6, f"Total: ${total:.2f}", ln=1)
+                pdf.cell(0, 6, f"Payment type: {payment_type}", ln=1)
+                if payment_type == "Cash":
+                    pdf.cell(0, 6, f"Cash given: ${cash_given:.2f}", ln=1)
+                    pdf.cell(0, 6, f"Change due: ${change_due:.2f}", ln=1)
+
+                # Notes
                 if receipt_notes:
-                    pdf.multi_cell(0,6,f"Notes: {receipt_notes}")
+                    notes_safe = receipt_notes.encode('latin-1', 'replace').decode('latin-1')
+                    pdf.multi_cell(0, 6, f"Notes: {notes_safe}")
+
+                # QR Code
+                qr = qrcode.QRCode(version=1, box_size=2, border=1)
+                qr.add_data(f"Receipt#{sale_id}")
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                qr_bytes = BytesIO()
+                img.save(qr_bytes, format='PNG')
+                qr_bytes.seek(0)
+                pdf.image(qr_bytes, x=160, y=10, w=30)
+
                 pdf.output(pdf_bytes)
                 pdf_bytes.seek(0)
                 st.download_button("Download Receipt (PDF)", pdf_bytes, file_name=f"receipt_{sale_id}.pdf")
                 st.success(f"Sale completed (ID {sale_id})")
+
+                # Reset cart after sale
                 st.session_state.cart = []
 
-# ---------------------------
-# Tab 4: Reports & Export
-# ---------------------------
-with tabs[3]:
-    st.header("📁 Reports & Data Export")
-    for tbl in ["sites","crops","sales"]:
-        df = pd.read_sql(f"SELECT * FROM {tbl}", conn)
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button(f"Download {tbl}.csv", csv_bytes, file_name=f"{tbl}.csv")
+    # -------------------------
+    # Optional: CSV export of crops / sales
+    # -------------------------
+    st.subheader("Export Data")
+    if st.button("Export Crops to CSV"):
+        c.execute("SELECT * FROM crops")
+        data = c.fetchall()
+        import pandas as pd
+        df = pd.DataFrame(data, columns=[desc[0] for desc in c.description])
+        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Crops CSV", csv_bytes, "crops.csv", "text/csv")
+
+    if st.button("Export Sales to CSV"):
+        c.execute("SELECT * FROM sales")
+        data = c.fetchall()
+        df = pd.DataFrame(data, columns=[desc[0] for desc in c.description])
+        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Sales CSV", csv_bytes, "sales.csv", "text/csv")
